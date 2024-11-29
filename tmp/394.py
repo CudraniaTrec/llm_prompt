@@ -1,0 +1,5 @@
+def check_distinct(tup):
+    return len(tup) == len(set(tup))
+assert check_distinct((1, 4, 5, 6, 1, 4)) == False
+assert check_distinct((1, 4, 5, 6)) == True
+assert check_distinct((2, 3, 4, 5, 6)) == True
