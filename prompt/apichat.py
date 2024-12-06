@@ -3,6 +3,7 @@ import json, beeprint
 from tqdm import tqdm
 import signal
 import pandas as pd
+import sys
 
 client = OpenAI(
         **json.load(open('apikey.json'))["closeai"]
@@ -19,6 +20,18 @@ def dump_results(dataset, model, method, tot, faillist):
     res_accuracy = f"{res_correct / tot:.2%}"
     results.loc[res_row_name, :] = [tot, res_correct, res_accuracy]
     results.to_csv('results.csv', index=True)
+
+# find the path of the dataset
+def find_data_path(dataset):
+    if dataset == "mbpp":
+        data_path = "datasets/sanitized-mbpp.json"
+    elif dataset == "humaneval":
+        data_path = "datasets/HumanEval.json"
+    elif dataset == "mathqa":
+        data_path = "datasets/mathqa-python-test.json"
+    else:
+        raise ValueError("Invalid dataset: "+dataset)
+    return data_path
 
 # examine the correctness of the code
 def complete_code(code,problem,dataset, test_num=5):
@@ -55,7 +68,7 @@ def test_correctness(dataset, problem, code):
         def handler(signum, frame):
             raise TimeoutError("Execution timed out")
         signal.signal(signal.SIGALRM, handler)
-        signal.alarm(5)  # Set the timeout to 5 seconds
+        signal.alarm(1)  # Set the timeout to 1 seconds
         try:
             namespace = {
                 '__file__': f"tmp/{problem['task_id']}.py",
@@ -77,7 +90,7 @@ def codegen_direct(model="gpt-4o-mini", dataset="mbpp"):
             question = "Write a python program to solve the following problem:\n"
             question += problem['prompt']
             question += "\nYour code should be able to solve the following test cases:\n"
-            question += problem['test_list'][0]
+            question += "\n".join(problem['test_list'])+ "\n"
         elif dataset == "humaneval":
             question = "Complete the following python code, according to the docstring:\n"
             question += problem['prompt']
@@ -103,14 +116,7 @@ def codegen_direct(model="gpt-4o-mini", dataset="mbpp"):
             code = "\n".join(lines)
         return test_correctness(dataset, problem, code)
 
-    if dataset == "mbpp":
-        datapath = f"datasets/sanitized-mbpp.json"
-    elif dataset == "humaneval":
-        datapath = f"datasets/HumanEval.json"
-    elif dataset == "mathqa":
-        datapath = f"datasets/mathqa-python-test.json"
-    else:
-        raise ValueError("Invalid dataset: "+dataset)
+    datapath = find_data_path(dataset)
     problems = json.load(open(datapath))[:500]
     fail_list = []
     with tqdm(total=len(problems)) as pbar:
@@ -130,43 +136,46 @@ def codegen_direct(model="gpt-4o-mini", dataset="mbpp"):
 # ask llm to generate code line by line
 # method: intermediate, simple
 def codegen_by_line_one(problem, dataset="mbpp", model="gpt-4o-mini", method="simple"):
-    def eval_partial_code(ans, problem, test_num=5):
-        code = '\n'.join(ans)
+    def eval_partial_code(code, problem, test_num=5):
         code = complete_code(code, problem, dataset, test_num)
         #try to run the code
         try:
             import subprocess
-            file_name = f"tmp/{problem['task_id'].replace("/","_")}.py"
+            file_name = f"tmp/{str(problem['task_id']).replace('/','_')}.py"
             with open(file_name, "w") as f:
                 f.write(code)
-            res = subprocess.run(["python", "intermediate.py", file_name], timeout=5,
+            res = subprocess.run(["python", "intermediate.py", file_name], timeout=1,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             if res.returncode!=0:
-                return False, res.stderr.decode()
+                return False, res.stdout.decode() + res.stderr.decode()
             else:
                 return True, res.stdout.decode()
         except Exception as e:
-            return False, f"\nError in Solving Problem{problem['task_id']}: {e}"
+            return False, f"\nError in Solving Problem {problem['task_id']}: {e}"
 
-    max_lines = 30
-    ans = [] if dataset == "mbpp" else problem['prompt'].split("\n")
+    max_queries = 10
     added_question = ""
+    code = ""
     while True:
         if dataset == "mbpp":
-            question = "Task: Write a python program line by line based on existed partial code to solve the following problem:\n"
+            question = "Write a python program block by block based on existed partial code to solve the following problem:\n"
             question += problem['prompt']+ "\n"
             question += "Example: Your code should be able to solve the following test cases:\n"
-            question += problem['test_list'][0]+ "\n"
-            question += "Partial Code: Here is the partial code(empty means you need to start writing the first line):\n"
-            question += "```python\n"+'\n'.join(ans)+"\n```\n"
+            question += "\n".join(problem['test_list'])+ "\n"
         elif dataset == "humaneval":
-            question = "Complete the following python partial program, according to the docstring:\n"
+            question = "Complete the following python partial program block by block, according to the docstring:\n"
             question += problem['prompt']+ "\n"
-            question += "You only need to continue with existing partial code and provide the rest of the method body\n"
+        elif dataset == "mathqa":
+            question = "Write a python program block by block based on existed partial code to solve the following math problem:\n"
+            question += problem['text']+ "\n"
+            question += "\nYou don't have to define any functions or methods, just name the final result variable as `answer`:\n"
         else:
             raise ValueError("Invalid dataset: "+dataset)
-        question += "Hint: If you believe the above code is completed, please output ##end##, don't give redunt line or redunt method\n"
-        question += "Only lines of code is needed, no explanation, no example usage\n"
+        question += "\nIn order to help you think deeper, you can add or modify existing code by at most 5 lines each time\n"
+        question += "[Hint]: If you believe the existing code is completed, please output ##end##\n"
+        question += "[Partial Code]: Here is the partial code(empty means you need to start writing the first line):\n"
+        question += "```python\n"+code+"\n```\n"
+        question += "You should output the code from the start, but only code is needed, no annotation, no explanation, no example usage\n"
         question += added_question
         added_question = ""
         response = client.chat.completions.create(
@@ -184,30 +193,29 @@ def codegen_by_line_one(problem, dataset="mbpp", model="gpt-4o-mini", method="si
             lines = code.splitlines()[1:-1]
             code = "\n".join(lines)
         # answer is too long
-        max_lines -= 1
-        if max_lines < 0:
+        max_queries -= 1
+        if max_queries < 0:
             break
         # gpt says is done
         if '##end##' in code:
-            if method != "simple" and len(ans)<=1:
+            if method != "simple" and len(code.splitlines())<=1:
                 continue
             break
         
-        if f"def {problem['entry_point']}(" in code:
-            ans=code.splitlines()
-        else:
-            ans+=code.splitlines()
         if method == "intermediate":
-            _, output = eval_partial_code(ans, problem, test_num=1)
-            output = output[-100000:]
-            added_question += "Live execution results for current code: \n"
+            res, output = eval_partial_code(code, problem, test_num=1)
+            if res:
+                return True
+            if len(output)>4000:
+                output = output[:2000]+"\n...\n"+output[-2000:]
+            added_question += "You can get the semantic of current partial codes based on live execution results:\n"
             added_question += f"{output}\n"
 
-    res, _ = eval_partial_code(ans, problem)
+    res, output = eval_partial_code(code, problem)
     return res
 
 def codegen_by_line(model="gpt-4o-mini", method="simple", dataset="mbpp",parallel=False):
-    data_path = f"datasets/{'sanitized-mbpp' if dataset=='mbpp' else 'HumanEval'}.json"
+    data_path = find_data_path(dataset)
     problems = json.load(open(data_path))[:500]
     if parallel:
         from multiprocessing import Pool
@@ -219,8 +227,8 @@ def codegen_by_line(model="gpt-4o-mini", method="simple", dataset="mbpp",paralle
                     fail_num+=1
                 pbar.update(1)
                 pbar.set_postfix({"failed": fail_num})
-            with Pool(20) as pool:
-                res = [pool.apply_async(codegen_by_line_one, (problem,dataset,model,method), callback=callback) 
+            with Pool(50) as pool:
+                res = [pool.apply_async(codegen_by_line_one, (problem, dataset, model, method), callback=callback) 
                        for problem in problems]
                 res = [r.get() for r in res]
         fail_list = [problem["task_id"] for problem, r in zip(problems, res) if not r]
@@ -240,5 +248,9 @@ def codegen_by_line(model="gpt-4o-mini", method="simple", dataset="mbpp",paralle
     dump_results(dataset, model, method, len(problems), fail_list)
 
 if __name__ == '__main__':
-    codegen_direct(model="gpt-4o-mini", dataset="mathqa")
-    # codegen_by_line(model="gpt-4o-mini", method="intermediate", dataset="humaneval",parallel=True)
+    args = sys.argv[1:]
+    if args:
+        dataset = args[0]
+        codegen_direct(dataset=dataset)
+    else:
+        codegen_by_line(model="gpt-4o-mini", method="intermediate", dataset="mbpp",parallel=True)

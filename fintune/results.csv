@@ -1,0 +1,9 @@
+name,total,acc,acc_rate
+mbpp__o1-mini,427.0,408.0,95.55%
+mbpp__gpt-4o-mini,427.0,358.0,83.84%
+mbpp__gpt-4o-mini__intermediate,427.0,367.0,85.95%
+humaneval__o1-mini,164.0,154.0,93.90%
+humaneval__gpt-4o-mini,164.0,142.0,86.59%
+humaneval__gpt-4o-mini__intermediate,164.0,152.0,92.68%
+mathqa__gpt-4o-mini,500.0,270.0,54.00%
+mathqa__gpt-4o-mini__intermediate,500.0,310.0,62.00%

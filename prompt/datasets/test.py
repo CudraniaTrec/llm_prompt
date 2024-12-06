@@ -5,7 +5,7 @@ datas = []
 import beeprint as bp
 for data in datas_test:
     datas.append({
-        'text': data['text'],
+        'prompt': data['text'],
         'code': data['code'],
         'rationale': data['reasoning'],
         'answer': data['answer'],

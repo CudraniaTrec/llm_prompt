@@ -1,3 +1,2 @@
-./tmp/*
-./datasets/test.py
-apikey.json
+**/tmp/*
+**/apikey.json
