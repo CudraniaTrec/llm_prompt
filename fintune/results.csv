@@ -7,3 +7,5 @@ humaneval__gpt-4o-mini,164.0,142.0,86.59%
 humaneval__gpt-4o-mini__intermediate,164.0,152.0,92.68%
 mathqa__gpt-4o-mini,500.0,270.0,54.00%
 mathqa__gpt-4o-mini__intermediate,500.0,310.0,62.00%
+codellama-instruct,427.0,228.0,53.40%
+humaneval__codellama-python,164.0,55.0,33.54%

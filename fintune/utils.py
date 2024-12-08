@@ -3,6 +3,8 @@ import json, signal
 from tqdm import tqdm
 import torch, os
 from transformers import AutoTokenizer, AutoModelForCausalLM
+import multiprocessing as mp
+import subprocess
 
 # dump results to csv
 def dump_results(dataset, model, method, tot, faillist):
@@ -63,79 +65,102 @@ def complete_code(code,problem,dataset, test_num=5):
         code += f"\nassert answer == {problem['answer']}"
     else:
         raise ValueError("Invalid dataset: "+dataset)
+    code = "\n".join([line for line in code.splitlines() if line.strip()])
     return code
 
-def test_correctness(dataset, problem, code):
+def test_correctness(dataset, problem, code, verbose=False):
     code = complete_code(code, problem, dataset)
     #try to run the code
-    try:
-        def handler(signum, frame):
-            raise TimeoutError("Execution timed out")
-        signal.signal(signal.SIGALRM, handler)
-        signal.alarm(1)  # Set the timeout to 1 seconds
-        try:
-            namespace = {
-                '__file__': f"tmp/{problem['task_id']}.py",
-                '__name__': '__main__',
-            }
-            exec(code, namespace)
-        finally:
-            signal.alarm(0)  # Disable the alarm
-        return True
-    except Exception as e:
-        # print(code)
-        # print(f"\nError in Solving Problem {problem['task_id']}: {e}")
+    p = subprocess.run(['python', '-c', code], 
+                       stdin=subprocess.PIPE, 
+                       stdout=subprocess.PIPE, 
+                       stderr=subprocess.PIPE, 
+                       timeout=5)
+    if p.returncode != 0:
+        if verbose:
+            print("Failed to run the code:")
+            print(p.stderr.decode())
+            print(code)
         return False
-
-def codegen_direct(model="starcoder-3b", dataset="mbpp"):
+    return True
+    
+def codegen_direct(model="codellama-instruct", dataset="mbpp"):
     """
     Generate code for the given dataset using the given model
     model: starcoder-3b, codellama-instruct, codellama-python
     dataset: mbpp, humaneval, mathqa
     """
+    model_name = model
     checkpoint = find_checkpoint(model)
-    tokenizer = AutoTokenizer.from_pretrained(checkpoint)
+    tokenizer = AutoTokenizer.from_pretrained(checkpoint, use_fast=True, local_files_only=True)
+    tokenizer.pad_token = tokenizer.eos_token
     # for fp16 use `torch_dtype=torch.float16` instead
-    model = AutoModelForCausalLM.from_pretrained(checkpoint, device_map="auto", torch_dtype=torch.bfloat16)
+    model = AutoModelForCausalLM.from_pretrained(checkpoint, 
+                                             device_map="auto",
+                                             local_files_only=True, 
+                                             torch_dtype=torch.bfloat16)
 
-    def codegen_one(problem):
-        if dataset == "mbpp":
-            question = "Write a python program to solve the following problem:\n"
-            question += problem['prompt']
-            question += "\nYour code should be able to solve the following test cases:\n"
-            question += "\n".join(problem['test_list'])+ "\n"
-        elif dataset == "humaneval":
-            question = "Complete the following python code, according to the docstring:\n"
-            question += problem['prompt']
-            question += "\nMethod header is given in the prompt, you only need to provide method body\n"
-        elif dataset == "mathqa":
-            question = "Write a python program to solve the following math problem:\n"
-            question += problem['text']
-            question += "\nYou don't have to define any functions or methods, just name the final result variable as `answer`:\n"
-        question += "\nOnly the code is needed, no explanation, no example usage"
+    def codegen_batch(problems):
+        def getinput(problem):
+            if dataset == "mbpp":
+                question = "Complete the following task in Python.\n"
+                question += problem['prompt']
+                question += "\nPlease respond with code only, no explanations, no example IOs, no annotations and no print statements.\n"
+                question += "\nYour code should be able to solve the following test cases:\n"
+                question += "\n".join(problem['test_list'])
+                # add # to the beginning of each line
+                question = "\n".join(["# "+line for line in question.splitlines()])
+                question += "\ndef"
 
-        inputs = tokenizer.encode(question, return_tensors="pt").to("cuda")
-        outputs = model.generate(inputs)
-        code = tokenizer.decode(outputs[0])
-        ## if the code is wrapped in markdown, remove it
-        if code.startswith("```") and code.endswith("```"):
-            lines = code.splitlines()[1:-1]
-            code = "\n".join(lines)
-        return test_correctness(dataset, problem, code)
+            elif dataset == "humaneval":
+                question = "# Complete the following python code, according to the docstring:\n"
+                question += "\n# Please respond with code only, no explanations, no example IOs, no annotations and no print statements.\n"
+                question += problem['prompt']
+
+            elif dataset == "mathqa":
+                question = "Write a python program to solve the following math problem:\n"
+                question += problem['text']
+                question += "\nYou don't have to define any functions or methods, just name the final result variable as `answer`:\n"
+            else:
+                raise ValueError("Invalid dataset: "+dataset)
+            return question
+        def process_output(code):
+            if code.startswith("```") and code.endswith("```"):
+                code = "\n".join(code.splitlines()[1:-1])
+            code = code.replace(tokenizer.bos_token, "").replace(tokenizer.eos_token, "")
+            # remove replicated \n
+            code = "\n".join([line for line in code.splitlines() if line.strip()])
+            return code
+        
+        questions = [getinput(problem) for problem in problems]
+        inputs = tokenizer(questions, 
+                           return_tensors="pt", 
+                           padding=True, 
+                           truncation=True,
+                           max_length=768)
+        # print input length
+        # print("Input length: ", inputs["input_ids"].shape[1])
+        inputs = {k: v.to("cuda") for k, v in inputs.items()}
+        with torch.no_grad():
+            outputs = model.generate(**inputs, 
+                            pad_token_id=tokenizer.eos_token_id,
+                            max_length=1024)
+        failed_list = []
+        for i, problem in enumerate(problems):
+            code = process_output(tokenizer.decode(outputs[i]))
+            if not test_correctness(dataset, problem, code, verbose=False):
+                failed_list.append(problem["task_id"])
+        return failed_list
 
     datapath = find_data_path(dataset)
     problems = json.load(open(datapath))[:500]
     fail_list = []
+    batch_size = 20
     with tqdm(total=len(problems)) as pbar:
-        for problem in problems:
-            try:
-                if not codegen_one(problem):
-                    fail_list.append(problem["task_id"])
-            except Exception as e:
-                print(f"\nError in Solving Problem {problem['task_id']}: {e}")
-                fail_list.append(problem["task_id"])
-            pbar.update(1)
+        for i in range(0, len(problems), batch_size):
+            res = codegen_batch(problems[i:i+batch_size])
+            fail_list += res
+            pbar.update(batch_size)
             pbar.set_postfix({"failed": len(fail_list)})
-
     print(f"Failed {len(fail_list)} out of {len(problems)} problems:")
-    dump_results(dataset, model, "", len(problems), fail_list)
+    dump_results(dataset, model_name, "", len(problems), fail_list)
