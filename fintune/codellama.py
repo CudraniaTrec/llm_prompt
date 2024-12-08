@@ -2,7 +2,7 @@ import torch, os
 import random, numpy as np
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "2,3"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 checkpoint = "codellama/CodeLlama-7b-Instruct-hf"
 
@@ -27,6 +27,7 @@ def test_codellama():
     # Your code should be able to pass the following test cases.
     # assert heap_queue_largest( [25, 35, 22, 85, 14, 65, 75, 22, 58],3)==[85, 75, 65]
     # assert heap_queue_largest( [25, 35, 22, 85, 14, 65, 75, 22, 58],5)==[85, 75, 65, 58, 35]
+    def
     """
     inputs = tokenizer.encode(input_string, return_tensors="pt").to("cuda")
     outputs = model.generate(inputs, 
