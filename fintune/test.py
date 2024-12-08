@@ -1,4 +1,6 @@
 from vllm import LLM, SamplingParams
+import os
+# os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
 prompts = [
     "Hello, my name is",
     "The president of the United States is",

@@ -12,7 +12,7 @@ model = AutoModelForSeq2SeqLM.from_pretrained(checkpoint,
                                              local_files_only=True, 
                                              trust_remote_code=True,
                                              torch_dtype=torch.bfloat16)
-config 
+
 print("="*20+"test codet5+"+"="*20)
 input_string = """
 # Complete the following task in Python. 
