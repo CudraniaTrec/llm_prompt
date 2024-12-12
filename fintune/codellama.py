@@ -1,8 +1,8 @@
 import torch, os
 import random, numpy as np
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 
-# os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,2,3"
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 checkpoint = "codellama/CodeLlama-7b-Instruct-hf"
 
@@ -19,6 +19,9 @@ def test_codellama():
                                                 device_map="auto",
                                                 local_files_only=True, 
                                                 torch_dtype=torch.bfloat16)
+    config = AutoConfig.from_pretrained(checkpoint, local_files_only=True)
+    print(config)
+    print(model)
     print("="*20+"test codellama"+"="*20)
     input_string = """
     # Complete the following task in Python. 
@@ -42,5 +45,5 @@ from utils import codegen_direct
 
 if __name__ == "__main__":
     set_seed(321876902)
-    # test_codellama()
-    codegen_direct(model="codellama-python", dataset="humaneval")
+    test_codellama()
+    # codegen_direct(model="codellama-instruct", dataset="mbpp")

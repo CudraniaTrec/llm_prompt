@@ -24,8 +24,7 @@ input_string ="""
 inputs = tokenizer.encode(input_string, return_tensors="pt").to("cuda")
 outputs = model.generate(inputs, 
                          pad_token_id=tokenizer.eos_token_id,
-                         attention_mask=torch.ones_like(inputs), 
-                         early_stopping=True,
+                         attention_mask=torch.ones_like(inputs),
                          max_length=500)
 print(tokenizer.decode(outputs[0]))
 print(f"Memory footprint: {model.get_memory_footprint() / 1e6:.2f} MB")

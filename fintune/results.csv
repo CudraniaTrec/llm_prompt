@@ -1,4 +1,5 @@
 name,total,acc,acc_rate
-codellama-instruct,427.0,228.0,53.40%
-humaneval__codellama-python,164.0,51.0,31.10%
-humaneval__codellama-instruct,164.0,37.0,22.56%
+mbpp__codellama-python,427.0,228.0,53.40%
+humaneval__codellama-python,164.0,55.0,33.54%
+humaneval__codellama-instruct,164.0,41.0,25.00%
+mbpp__codellama-instruct,427.0,237.0,55.50%
