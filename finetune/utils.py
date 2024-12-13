@@ -5,6 +5,7 @@ import torch, os
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import multiprocessing as mp
 import subprocess
+import random, numpy as np
 
 # dump results to csv
 def dump_results(dataset, model, method, tot, faillist):
@@ -35,6 +36,10 @@ def find_checkpoint(model):
         checkpoint = "codellama/CodeLlama-7b-Instruct-hf"
     elif model == "codellama-python":
         checkpoint = "codellama/CodeLlama-7b-Python-hf"
+    elif model == "qwen1.5":
+        checkpoint = "Qwen/Qwen2.5-1.5B-Instruct"
+    elif model == "opencoder1.5":
+        checkpoint = "infly/OpenCoder-1.5B-Instruct"
     else:
         raise ValueError("Invalid model: "+model)
     return checkpoint
@@ -71,89 +76,77 @@ def complete_code(code,problem,dataset, test_num=5):
 def test_correctness(dataset, problem, code, verbose=False):
     code = complete_code(code, problem, dataset)
     #try to run the code
-    p = subprocess.run(['python', '-c', code], 
-                       stdin=subprocess.PIPE, 
-                       stdout=subprocess.PIPE, 
-                       stderr=subprocess.PIPE, 
-                       timeout=5)
-    if p.returncode != 0:
+
+    # set up the timeout
+    def handler(signum, frame):
+        raise Exception("timeout")
+    signal.signal(signal.SIGALRM, handler)
+    signal.alarm(5)
+    try:
+        p = subprocess.run(['python', '-c', code],
+                               stdin=subprocess.PIPE,
+                               stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE,
+                               timeout=5)
+        if p.returncode != 0:
+            if verbose:
+                print("Failed to run the code:")
+                print(p.stderr.decode())
+                print(code)
+            return False
+    except Exception as e:
         if verbose:
-            print("Failed to run the code:")
-            print(p.stderr.decode())
+            print("Timeout:")
             print(code)
         return False
+    finally:
+        signal.alarm(0)
     return True
-    
-def codegen_direct(model="codellama-instruct", dataset="mbpp"):
+
+# code generation for the given dataset
+def codegen_direct(model, dataset, get_input, process_output):
     """
     Generate code for the given dataset using the given model
-    model: starcoder-3b, codellama-instruct, codellama-python
+    model: starcoder-3b, codellama-instruct, codellama-python, qwen1.5, opencoder1.5
     dataset: mbpp, humaneval, mathqa
     """
     model_name = model
     checkpoint = find_checkpoint(model)
-    tokenizer = AutoTokenizer.from_pretrained(checkpoint, use_fast=True, local_files_only=True)
-    tokenizer.pad_token = tokenizer.eos_token
-    # for fp16 use `torch_dtype=torch.float16` instead
+    tokenizer = AutoTokenizer.from_pretrained(checkpoint,
+                                              use_fast=True,
+                                              trust_remote_code=True,
+                                              local_files_only=True)
+    if not tokenizer.pad_token:
+        tokenizer.pad_token = tokenizer.eos_token
     model = AutoModelForCausalLM.from_pretrained(checkpoint, 
                                              device_map="auto",
-                                             local_files_only=True, 
+                                             local_files_only=True,
+                                             trust_remote_code=True,
                                              torch_dtype=torch.bfloat16)
 
     def codegen_batch(problems):
-        def getinput(problem):
-            if dataset == "mbpp":
-                question = "Complete the following task in Python.\n"
-                question += problem['prompt']
-                question += "\nPlease respond with code only, no explanations, no example IOs, no annotations and no print statements.\n"
-                question += "\nYour code should be able to solve the following test cases:\n"
-                question += "\n".join(problem['test_list'])
-                # add # to the beginning of each line
-                question = "\n".join(["# "+line for line in question.splitlines()])
-                question += "\ndef"
-
-            elif dataset == "humaneval":
-                question = "# Complete the following python code, according to the docstring:\n"
-                question += "\n# Please respond with code only, no explanations, no example IOs, no annotations and no print statements.\n"
-                question += problem['prompt']
-
-            elif dataset == "mathqa":
-                question = "Write a python program to solve the following math problem:\n"
-                question += problem['text']
-                question += "\nYou don't have to define any functions or methods, just name the final result variable as `answer`:\n"
-            else:
-                raise ValueError("Invalid dataset: "+dataset)
-            return question
-        def process_output(code):
-            if code.startswith("```") and code.endswith("```"):
-                code = "\n".join(code.splitlines()[1:-1])
-            code = code.replace(tokenizer.bos_token, "").replace(tokenizer.eos_token, "")
-            # remove replicated \n
-            code = "\n".join([line for line in code.splitlines() if line.strip()])
-            return code
-        
-        questions = [getinput(problem) for problem in problems]
-        inputs = tokenizer(questions, 
-                           return_tensors="pt", 
-                           padding=True, 
+        questions = [get_input(problem,dataset,tokenizer) for problem in problems]
+        inputs = tokenizer(questions,
+                           padding=True,
+                           padding_side="left",
                            truncation=True,
-                           max_length=768)
-        # print input length
-        # print("Input length: ", inputs["input_ids"].shape[1])
-        inputs = {k: v.to("cuda") for k, v in inputs.items()}
+                           max_length=1024,
+                           return_tensors="pt").to("cuda")
         with torch.no_grad():
-            outputs = model.generate(**inputs, 
-                            pad_token_id=tokenizer.eos_token_id,
-                            max_length=1024)
+            outputs = model.generate(**inputs,
+                                     pad_token_id=tokenizer.pad_token_id,
+                                     max_new_tokens=1024,
+                                     do_sample=False)
         failed_list = []
         for i, problem in enumerate(problems):
-            code = process_output(tokenizer.decode(outputs[i]))
+            output = tokenizer.decode(outputs[i], skip_special_tokens=True)
+            code = process_output(output, tokenizer)
             if not test_correctness(dataset, problem, code, verbose=False):
                 failed_list.append(problem["task_id"])
         return failed_list
 
     datapath = find_data_path(dataset)
-    problems = json.load(open(datapath))[:500]
+    problems = json.load(open(datapath))
     fail_list = []
     batch_size = 20
     with tqdm(total=len(problems)) as pbar:
@@ -164,3 +157,10 @@ def codegen_direct(model="codellama-instruct", dataset="mbpp"):
             pbar.set_postfix({"failed": len(fail_list)})
     print(f"Failed {len(fail_list)} out of {len(problems)} problems:")
     dump_results(dataset, model_name, "", len(problems), fail_list)
+
+# set seed for reproducibility
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
