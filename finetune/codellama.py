@@ -52,23 +52,31 @@ def get_input(problem,dataset,tokenizer):
         question += "\n# Please respond with code only, no explanations, no example IOs, no annotations and no print statements.\n"
         question += problem['prompt']
     elif dataset == "mathqa":
-        question = "Write a python program to solve the following math problem:\n"
-        question += problem['text']
-        question += "\nYou don't have to define any functions or methods, just name the final result variable as `answer`:\n"
+        question = "# Write a python program to solve the following math problem:\n"
+        question += f"{problem['text']}"
+        question += "\n# You don't have to define any functions or methods, just name the final result variable as `answer`:\n"
+        question += "```python\n"
     else:
         raise ValueError("Invalid dataset: "+dataset)
     return question
 def process_output(code,tokenizer):
-    if code.startswith("```") and code.endswith("```"):
-        code = "\n".join(code.splitlines()[1:-1])
+    lines = code.splitlines()
+    # retrieve the code block
+    if "```python" in lines:
+        start_lineno = lines.index("```python")+1
+        try:
+            end_lineno = lines.index("```",start_lineno)
+        except:
+            end_lineno = len(lines)
+        lines=lines[start_lineno:end_lineno]
     # remove replicated \n and annotations
-    code = "\n".join([line for line in code.splitlines()
+    code = "\n".join([line for line in lines
                       if line.strip() and not line.strip().startswith("#")])
-    return code.replace(tokenizer.eos_token,"")
+    return code.replace(tokenizer.eos_token,"").replace(tokenizer.pad_token,"")
 
 if __name__ == "__main__":
-    test_codellama()
+    # test_codellama()
     codegen_direct(model="codellama-python",
-    dataset="humaneval",
+    dataset="mathqa",
     get_input=get_input,
     process_output=process_output)

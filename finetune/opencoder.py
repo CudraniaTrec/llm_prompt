@@ -4,7 +4,7 @@ from utils import set_seed,codegen_direct
 
 set_seed(321876902)
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "2,3"
 model_name = "infly/OpenCoder-1.5B-Instruct"
 
 def test_opencoder():
@@ -114,4 +114,4 @@ def process_output(output,tokenizer):
 
 if __name__ == "__main__":
     # test_opencoder()
-    codegen_direct("opencoder1.5","mathqa",get_input,process_output)
+    codegen_direct("qwen7","mathqa",get_input,process_output)

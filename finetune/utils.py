@@ -13,6 +13,7 @@ def dump_results(dataset, model, method, tot, faillist):
     res_row_name = f"{dataset}__{model}__{method}" if method else f"{dataset}__{model}"
     res_correct = tot - len(faillist)
     res_accuracy = f"{res_correct / tot:.2%}"
+    print(f"Results for {res_row_name}: {res_correct}/{tot} ({res_accuracy})")
     results.loc[res_row_name, :] = [tot, res_correct, res_accuracy]
     results.to_csv('results.csv', index=True)
 
@@ -38,23 +39,32 @@ def find_checkpoint(model):
         checkpoint = "codellama/CodeLlama-7b-Python-hf"
     elif model == "qwen1.5":
         checkpoint = "Qwen/Qwen2.5-1.5B-Instruct"
+    elif model == "qwen7":
+        checkpoint = "Qwen/Qwen2.5-7B-Instruct"
     elif model == "opencoder1.5":
         checkpoint = "infly/OpenCoder-1.5B-Instruct"
+    elif model == "opencoder8":
+        checkpoint = "infly/OpenCoder-8B-Instruct"
     else:
         raise ValueError("Invalid model: "+model)
     return checkpoint
 
 # examine the correctness of the generated code
-def complete_code(code,problem,dataset, test_num=5):
+def complete_code(code, problem, dataset, test_num=10):
     if dataset == "mbpp":
         for test_import in problem['test_imports']:
             code = test_import + "\n" + code
         for test_case in problem['test_list'][:test_num]:
             code += "\n" + test_case
     elif dataset == "humaneval":
-        tests = problem['test'].split("\n")
+        tests = problem['test']
+        # remove metadata definition
+        if "METADATA" in tests:
+            start_idx = tests.index("METADATA")
+            end_idx = tests.index("}", start_idx)
+            tests = tests[:start_idx] + tests[end_idx+1:]
         new_tests = []
-        for test in tests:
+        for test in tests.split("\n"):
             if "assert" in test:
                 if test_num>0:
                     new_tests.append(test)
@@ -70,7 +80,19 @@ def complete_code(code,problem,dataset, test_num=5):
         code += f"\nassert answer == {problem['answer']}"
     else:
         raise ValueError("Invalid dataset: "+dataset)
-    code = "\n".join([line for line in code.splitlines() if line.strip()])
+
+    # remove multiline comments
+    while "'''" in code:
+        start_idx = code.index("'''")
+        end_idx = code.index("'''", start_idx + 3)
+        code = code[:start_idx] + code[end_idx+3:]
+    while '"""' in code:
+        start_idx = code.index('"""')
+        end_idx = code.index('"""', start_idx + 3)
+        code = code[:start_idx] + code[end_idx+3:]
+
+    # remove empty lines and annotations
+    code = "\n".join([line for line in code.splitlines() if line.strip() and not line.strip().startswith("#")])
     return code
 
 def test_correctness(dataset, problem, code, verbose=False):
@@ -90,12 +112,14 @@ def test_correctness(dataset, problem, code, verbose=False):
                                timeout=5)
         if p.returncode != 0:
             if verbose:
+                print('='*20)
                 print("Failed to run the code:")
                 print(p.stderr.decode())
                 print(code)
             return False
     except Exception as e:
         if verbose:
+            print('='*20)
             print("Timeout:")
             print(code)
         return False
@@ -135,8 +159,7 @@ def codegen_direct(model, dataset, get_input, process_output):
         with torch.no_grad():
             outputs = model.generate(**inputs,
                                      pad_token_id=tokenizer.pad_token_id,
-                                     max_new_tokens=1024,
-                                     do_sample=False)
+                                     max_new_tokens=512)
         failed_list = []
         for i, problem in enumerate(problems):
             output = tokenizer.decode(outputs[i], skip_special_tokens=True)
@@ -148,14 +171,13 @@ def codegen_direct(model, dataset, get_input, process_output):
     datapath = find_data_path(dataset)
     problems = json.load(open(datapath))
     fail_list = []
-    batch_size = 20
+    batch_size = 30
     with tqdm(total=len(problems)) as pbar:
         for i in range(0, len(problems), batch_size):
             res = codegen_batch(problems[i:i+batch_size])
             fail_list += res
             pbar.update(batch_size)
             pbar.set_postfix({"failed": len(fail_list)})
-    print(f"Failed {len(fail_list)} out of {len(problems)} problems:")
     dump_results(dataset, model_name, "", len(problems), fail_list)
 
 # set seed for reproducibility
