@@ -1,4 +1,4 @@
-**/tmp/*
+prompt/tmp/*
 **/apikey.json
 .idea/
 finetune/swanlog
