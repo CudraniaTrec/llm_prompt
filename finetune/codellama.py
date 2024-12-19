@@ -1,12 +1,12 @@
 import torch, os
 import random, numpy as np
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
-from utils import codegen_direct, set_seed
+from utils import codegen_direct, set_seed, config
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "0,2,3"
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 checkpoint = "codellama/CodeLlama-7b-Python-hf"
-set_seed(321876902)
+set_seed(config["seed"])
 
 def test_codellama():
     tokenizer = AutoTokenizer.from_pretrained(checkpoint, use_fast=True, local_files_only=True)

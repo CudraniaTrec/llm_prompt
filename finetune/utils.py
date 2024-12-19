@@ -1,11 +1,19 @@
 import pandas as pd
 import json, signal
+
 from tqdm import tqdm
 import torch, os
 from transformers import AutoTokenizer, AutoModelForCausalLM
-import multiprocessing as mp
+from datasets import load_dataset
 import subprocess
 import random, numpy as np
+
+config = {
+    "max_input_length": 1024,
+    "max_output_length": 512,
+    'batch_size': 40,
+    'seed': 321876902
+}
 
 # dump results to csv
 def dump_results(dataset, model, method, tot, faillist):
@@ -29,6 +37,32 @@ def find_data_path(dataset):
         raise ValueError("Invalid dataset: "+dataset)
     return data_path
 
+# load and split the dataset
+def prepare_data(dataset_name):
+    if dataset_name == "mbpp":
+        # dataset = find_data_path("mbpp")
+        # data = json.load(open(dataset))
+        # def store_split(s):
+        #     with open(f"tmp/mbpp_{s}.json", "w") as f:
+        #         json.dump([d for d in data if d['split']==s], f, indent=2)
+        # for s in ['prompt', 'train', 'validation', 'test']:
+        #     store_split(s)
+        return load_dataset('json', data_files={'test': 'tmp/mbpp_test.json',
+                                                'train': 'tmp/mbpp_train.json',
+                                                'valid': 'tmp/mbpp_validation.json',
+                                                'prompt': 'tmp/mbpp_prompt.json'})
+    elif dataset_name == "humaneval":
+        dataset = find_data_path("humaneval")
+        return load_dataset('json', data_files={'test': dataset})
+    elif dataset_name == "mathqa":
+        test_dataset = find_data_path("mathqa")
+        train_dataset = test_dataset.replace("test", "train")
+        print(test_dataset, train_dataset)
+        return load_dataset('json', data_files={'test': test_dataset,
+                                                'train': train_dataset})
+    else:
+        raise ValueError("Invalid dataset: "+dataset_name)
+
 # find check point for the model
 def find_checkpoint(model):
     if model == "starcoder-3b":
@@ -49,7 +83,7 @@ def find_checkpoint(model):
         raise ValueError("Invalid model: "+model)
     return checkpoint
 
-# examine the correctness of the generated code
+# complete the generated code with the test cases
 def complete_code(code, problem, dataset, test_num=10):
     if dataset == "mbpp":
         for test_import in problem['test_imports']:
@@ -95,6 +129,7 @@ def complete_code(code, problem, dataset, test_num=10):
     code = "\n".join([line for line in code.splitlines() if line.strip() and not line.strip().startswith("#")])
     return code
 
+# examine the correctness of the generated code
 def test_correctness(dataset, problem, code, verbose=False):
     code = complete_code(code, problem, dataset)
     #try to run the code
@@ -154,12 +189,12 @@ def codegen_direct(model, dataset, get_input, process_output):
                            padding=True,
                            padding_side="left",
                            truncation=True,
-                           max_length=1024,
+                           max_length=config["max_input_length"],
                            return_tensors="pt").to("cuda")
         with torch.no_grad():
             outputs = model.generate(**inputs,
                                      pad_token_id=tokenizer.pad_token_id,
-                                     max_new_tokens=512)
+                                     max_new_tokens=config["max_output_length"],)
         failed_list = []
         for i, problem in enumerate(problems):
             output = tokenizer.decode(outputs[i], skip_special_tokens=True)
@@ -171,7 +206,7 @@ def codegen_direct(model, dataset, get_input, process_output):
     datapath = find_data_path(dataset)
     problems = json.load(open(datapath))
     fail_list = []
-    batch_size = 30
+    batch_size = config['batch_size']
     with tqdm(total=len(problems)) as pbar:
         for i in range(0, len(problems), batch_size):
             res = codegen_batch(problems[i:i+batch_size])
@@ -186,3 +221,12 @@ def set_seed(seed):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+def print_special_tokens(tokenizer):
+    print("Special tokens:")
+    print(tokenizer.special_tokens_map)
+    for token_name, token in tokenizer.special_tokens_map.items():
+        token_id = tokenizer.convert_tokens_to_ids(token)
+        print(f"{token_name}: '{token}' (ID: {token_id})")
+
+

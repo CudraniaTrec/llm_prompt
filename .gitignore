@@ -1,3 +1,5 @@
 **/tmp/*
 **/apikey.json
 .idea/
+finetune/swanlog
+finetune/wandb

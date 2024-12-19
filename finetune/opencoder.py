@@ -1,12 +1,13 @@
 import torch,os
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
-from utils import set_seed,codegen_direct
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, TrainingArguments, Trainer
+from utils import set_seed, codegen_direct, config, prepare_data, print_special_tokens
 
-set_seed(321876902)
-os.environ["TOKENIZERS_PARALLELISM"] = "true"
-os.environ["CUDA_VISIBLE_DEVICES"] = "2,3"
+set_seed(config['seed'])
 model_name = "infly/OpenCoder-1.5B-Instruct"
+os.environ["TOKENIZERS_PARALLELISM"] = "true"
+os.environ["CUDA_VISIBLE_DEVICES"] = "4"
 
+# 1 example inference
 def test_opencoder():
     model = AutoModelForCausalLM.from_pretrained(model_name,
                                                  torch_dtype=torch.bfloat16,
@@ -21,10 +22,7 @@ def test_opencoder():
     print(config)
     print(model)
     # 打印特殊 token 及其 ID
-    print("Special Tokens and their IDs:")
-    for token_name, token in tokenizer.special_tokens_map.items():
-        token_id = tokenizer.convert_tokens_to_ids(token)
-        print(f"{token_name}: '{token}' (ID: {token_id})")
+    print_special_tokens(tokenizer)
     question1 = """Write a python program to solve the following math problem:
 what will be the difference between simple and compound interest at 14 % per annum on a sum of rs . 1000 after 4 years ? 
 n0 = 14.0 n1 = 1000.0 n2 = 4.0
@@ -66,7 +64,8 @@ assert heap_queue_largest( [25, 35, 22, 85, 14, 65, 75, 22, 58],5)==[85, 75, 65,
     result = tokenizer.decode(outputs[1], skip_special_tokens=True)
     print(process_output(result,tokenizer))
 
-def get_input(problem,dataset,tokenizer):
+# generate prompt to the opencoder/qwen
+def get_input(problem, dataset, tokenizer):
     if dataset == "mbpp":
         question = "Complete the following task in Python.\n"
         question += problem['prompt']
@@ -81,7 +80,7 @@ def get_input(problem,dataset,tokenizer):
         question += "\n```\n"
     elif dataset == "mathqa":
         question = "Write a python program to solve the following math problem:\n"
-        question += problem['text']
+        question += problem['prompt']
         question += "\nYou don't have to define any functions or methods, just name the final result variable as `answer`:\n"
     else:
         raise ValueError(f"dataset {dataset} not supported")
@@ -94,7 +93,8 @@ def get_input(problem,dataset,tokenizer):
         add_generation_prompt=True,
     )
 
-def process_output(output,tokenizer):
+# extract code from the opencoder/qwen output
+def process_output(output, tokenizer):
     # remove the chat history
     lines = output.splitlines()
     assistant_lineno = lines.index("assistant")
@@ -112,6 +112,79 @@ def process_output(output,tokenizer):
                       if line.strip() and not line.strip().startswith("#")])
     return code.replace(tokenizer.eos_token,"").replace(tokenizer.pad_token,"")
 
+# finetune the model
+def finetune():
+    # prepare trainning data
+    dataset = prepare_data("mbpp")
+    tokenizer = AutoTokenizer.from_pretrained(model_name,
+                                              use_fast=True,
+                                              trust_remote_code=True,
+                                              local_files_only=True)
+    def preprocess_function(examples):
+        new_examples = []
+        for i in range(len(examples['prompt'])):
+            problem = {
+                'prompt': examples['prompt'][i],
+                'test_list': examples['test_list'][i]
+            }
+            new_examples.append(problem)
+        inputs = [get_input(example, "mbpp", tokenizer) for example in new_examples]
+        outputs = examples['code']
+        tokenized_inputs = tokenizer(inputs,
+                                     padding=True,
+                                     padding_side="left",
+                                     truncation=True,
+                                     max_length=config['max_input_length'])
+        tokenized_outputs = tokenizer(outputs,
+                                      padding=True,
+                                      truncation=True,
+                                      max_length=config['max_output_length'])
+        model_inputs = tokenized_inputs
+        model_inputs["labels"] = [
+            [-100] * len(input_ids) + output_ids
+            for input_ids, output_ids in zip(tokenized_inputs["input_ids"], tokenized_outputs["input_ids"])
+        ]
+        model_inputs["input_ids"] = [
+            input_ids + output_ids
+            for input_ids, output_ids in zip(tokenized_inputs["input_ids"], tokenized_outputs["input_ids"])
+        ]
+        model_inputs["attention_mask"] = [
+            attention_mask + [1] * len(output_ids)
+            for attention_mask, output_ids in zip(tokenized_inputs["attention_mask"], tokenized_outputs["attention_mask"])
+        ]
+        return model_inputs
+
+    dataset = dataset.map(preprocess_function, batched=True,
+                          remove_columns=dataset['test'].column_names)
+    print(dataset)
+    training_args = TrainingArguments(
+        output_dir=f"./output/{model_name}",
+        overwrite_output_dir=True,
+        per_device_train_batch_size=config['batch_size'],
+        num_train_epochs=5,
+        logging_dir="./runs",
+        logging_strategy="epoch",
+        save_strategy="epoch",
+        eval_strategy="epoch",
+        save_total_limit=2,
+        learning_rate=5e-5,
+        report_to="wandb",
+        run_name=f"{model_name}-mbpp",
+    )
+    model = AutoModelForCausalLM.from_pretrained(model_name,
+                                                 torch_dtype=torch.bfloat16,
+                                                 device_map="auto",
+                                                 trust_remote_code=True,
+                                                 local_files_only=True)
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=dataset["train"],
+        eval_dataset=dataset["valid"],
+    )
+    trainer.train()
+    trainer.save_model()
+
 if __name__ == "__main__":
-    # test_opencoder()
-    codegen_direct("qwen7","mathqa",get_input,process_output)
+    # codegen_direct("qwen7","mathqa", get_input, process_output)
+    finetune()
