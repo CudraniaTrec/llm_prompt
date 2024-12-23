@@ -3,4 +3,5 @@ prompt/tmp/*
 .idea/
 finetune/swanlog
 finetune/wandb
+output/
 **/checkpoint*/
