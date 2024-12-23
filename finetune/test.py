@@ -1,30 +1,13 @@
-import swanlab
-import random
+import pandas as pd
+results = pd.read_csv('results.csv', index_col='name')
+new_res = pd.DataFrame(columns=['model', 'mbpp', 'humaneval', 'mathqa']).set_index('model')
+for model in results.index:
+    row = results.loc[model]
+    dataset = model.split('__')[0]
+    model_name = model.split('__')[1]
+    tot = int(row['total'])
+    acc = int(row['acc'])
+    rate = row['acc_rate']
+    new_res.loc[model_name, dataset] = f"{acc}/{tot} ({rate})"
+new_res.to_csv('results.csv', index=True)
 
-# 创建一个SwanLab项目
-swanlab.init(
-    workspace="Cudrania",
-    # 设置项目名
-    project="my-awesome-project",
-
-    # 设置超参数
-    config={
-        "learning_rate": 0.02,
-        "architecture": "CNN",
-        "dataset": "CIFAR-100",
-        "epochs": 10
-    }
-)
-
-# 模拟一次训练
-epochs = 10
-offset = random.random() / 5
-for epoch in range(2, epochs):
-    acc = 1 - 2 ** -epoch - random.random() / epoch - offset
-    loss = 2 ** -epoch + random.random() / epoch + offset
-
-    # 记录训练指标
-    swanlab.log({"acc": acc, "loss": loss})
-
-# [可选] 完成训练，这在notebook环境中是必要的
-swanlab.finish()

@@ -1,28 +1,27 @@
 import torch,os
+from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, TrainingArguments, Trainer
 from utils import set_seed, codegen_direct, config, prepare_data, print_special_tokens
+from utils import EarlyStoppingCallback, find_checkpoint_path, find_checkpoint
 
 set_seed(config['seed'])
-model_name = "infly/OpenCoder-1.5B-Instruct"
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
-os.environ["CUDA_VISIBLE_DEVICES"] = "4"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "4"
 
-# 1 example inference
-def test_opencoder():
-    model = AutoModelForCausalLM.from_pretrained(model_name,
+# example inference
+def test_opencoder(model=None):
+    if not model:
+        model = 'qwen1.5'
+    checkpoint, _, _ = find_checkpoint_path(model)
+    model = AutoModelForCausalLM.from_pretrained(checkpoint,
                                                  torch_dtype=torch.bfloat16,
                                                  device_map="auto",
                                                  trust_remote_code=True,
                                                  local_files_only=True)
-    tokenizer = AutoTokenizer.from_pretrained(model_name,
+    tokenizer = AutoTokenizer.from_pretrained(checkpoint,
                                               use_fast=True,
                                               trust_remote_code=True,
                                               local_files_only=True)
-    config = AutoConfig.from_pretrained(model_name, local_files_only=True)
-    print(config)
-    print(model)
-    # 打印特殊 token 及其 ID
-    print_special_tokens(tokenizer)
     question1 = """Write a python program to solve the following math problem:
 what will be the difference between simple and compound interest at 14 % per annum on a sum of rs . 1000 after 4 years ? 
 n0 = 14.0 n1 = 1000.0 n2 = 4.0
@@ -33,17 +32,13 @@ Please respond with code only, no explanation, no example IO, no annotations.
 Your code should be able to pass the following test cases.
 assert heap_queue_largest( [25, 35, 22, 85, 14, 65, 75, 22, 58],3)==[85, 75, 65]
 assert heap_queue_largest( [25, 35, 22, 85, 14, 65, 75, 22, 58],5)==[85, 75, 65, 58, 35]"""
-    messages0=[
-        { 'role': 'user', 'content': question2 }
-    ]
+    messages0=[{ 'role': 'user', 'content': question2 }]
     text0 = tokenizer.apply_chat_template(
         messages0,
         tokenize=False,
         add_generation_prompt=True,
     )
-    messages1 = [
-        { 'role': 'user', 'content': question1 }
-    ]
+    messages1 = [ { 'role': 'user', 'content': question1 }]
     text1 = tokenizer.apply_chat_template(
         messages1,
         tokenize=False,
@@ -55,12 +50,10 @@ assert heap_queue_largest( [25, 35, 22, 85, 14, 65, 75, 22, 58],5)==[85, 75, 65,
                        truncation=True,
                        max_length=1024,
                        return_tensors="pt").to(model.device)
-    print(inputs)
     outputs = model.generate(**inputs,
                              pad_token_id=tokenizer.pad_token_id,
                              max_new_tokens=1024,
                              do_sample=False)
-    print(outputs)
     result = tokenizer.decode(outputs[1], skip_special_tokens=True)
     print(process_output(result,tokenizer))
 
@@ -113,9 +106,14 @@ def process_output(output, tokenizer):
     return code.replace(tokenizer.eos_token,"").replace(tokenizer.pad_token,"")
 
 # finetune the model
-def finetune():
-    # prepare trainning data
-    dataset = prepare_data("mbpp")
+def finetune(model_name, dataset_name):
+    model_name = find_checkpoint(model_name)
+    dataset = prepare_data(dataset_name)
+    model = AutoModelForCausalLM.from_pretrained(model_name,
+                                                 torch_dtype=torch.bfloat16,
+                                                 device_map="auto",
+                                                 trust_remote_code=True,
+                                                 local_files_only=True)
     tokenizer = AutoTokenizer.from_pretrained(model_name,
                                               use_fast=True,
                                               trust_remote_code=True,
@@ -123,16 +121,13 @@ def finetune():
     def preprocess_function(examples):
         new_examples = []
         for i in range(len(examples['prompt'])):
-            problem = {
-                'prompt': examples['prompt'][i],
-                'test_list': examples['test_list'][i]
-            }
+            problem = {key: examples[key][i] for key in examples.keys()}
             new_examples.append(problem)
-        inputs = [get_input(example, "mbpp", tokenizer) for example in new_examples]
-        outputs = examples['code']
+        inputs = [get_input(example, dataset_name, tokenizer) for example in new_examples]
+        outputs = [code + tokenizer.eos_token for code in examples['code']]
         tokenized_inputs = tokenizer(inputs,
                                      padding=True,
-                                     padding_side="left",
+                                     padding_side='left',
                                      truncation=True,
                                      max_length=config['max_input_length'])
         tokenized_outputs = tokenizer(outputs,
@@ -149,42 +144,56 @@ def finetune():
             for input_ids, output_ids in zip(tokenized_inputs["input_ids"], tokenized_outputs["input_ids"])
         ]
         model_inputs["attention_mask"] = [
-            attention_mask + [1] * len(output_ids)
-            for attention_mask, output_ids in zip(tokenized_inputs["attention_mask"], tokenized_outputs["attention_mask"])
+            input_mask + output_mask
+            for input_mask, output_mask in zip(tokenized_inputs["attention_mask"], tokenized_outputs["attention_mask"])
         ]
         return model_inputs
-
     dataset = dataset.map(preprocess_function, batched=True,
-                          remove_columns=dataset['test'].column_names)
+                          batch_size=config['batch_size_train']*torch.cuda.device_count(),
+                          remove_columns=dataset['train'].column_names)
     print(dataset)
+    def data_collator(datas):
+        max_length = max(len(data['input_ids']) for data in datas)
+        for data in datas:
+            data['input_ids'] += [tokenizer.pad_token_id] * (max_length - len(data['input_ids']))
+            data['attention_mask'] += [0] * (max_length - len(data['attention_mask']))
+            data['labels'] += [-100] * (max_length - len(data['labels']))
+        return {key: torch.tensor([data[key] for data in datas]) for key in datas[0].keys()}
     training_args = TrainingArguments(
-        output_dir=f"./output/{model_name}",
+        output_dir=f"./output/{model_name}/{dataset_name}",
         overwrite_output_dir=True,
-        per_device_train_batch_size=config['batch_size'],
+        per_device_train_batch_size=config['batch_size_train'],
         num_train_epochs=5,
-        logging_dir="./runs",
-        logging_strategy="epoch",
-        save_strategy="epoch",
-        eval_strategy="epoch",
-        save_total_limit=2,
-        learning_rate=5e-5,
+        logging_strategy="steps",
+        logging_steps=config['log_steps'][dataset_name],
+        eval_strategy="steps",
+        eval_steps=config['eval_steps'][dataset_name],
+        save_strategy="steps",
+        save_steps=config['eval_steps'][dataset_name],
+        save_total_limit=config['early_stopping_patience']+1,
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
+        learning_rate=config['learning_rate'][dataset_name],
+        seed=config['seed'],
+        bf16=True,
         report_to="wandb",
-        run_name=f"{model_name}-mbpp",
+        run_name=f"{model_name}-{dataset_name}",
     )
-    model = AutoModelForCausalLM.from_pretrained(model_name,
-                                                 torch_dtype=torch.bfloat16,
-                                                 device_map="auto",
-                                                 trust_remote_code=True,
-                                                 local_files_only=True)
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=dataset["train"],
         eval_dataset=dataset["valid"],
+        tokenizer=tokenizer,
+        data_collator= data_collator,
+        callbacks=[EarlyStoppingCallback(config['early_stopping_patience'],1e-5)],
     )
     trainer.train()
-    trainer.save_model()
+    trainer.save_model(f"./output/{model_name}/{dataset_name}/best_model")
 
 if __name__ == "__main__":
-    # codegen_direct("qwen7","mathqa", get_input, process_output)
-    finetune()
+    model = 'qwen1.5'
+    dataset = 'mathqa'
+    model_path= f"output/{find_checkpoint(model)}/{dataset}/best_model"
+    codegen_direct(model_path, dataset, get_input, process_output)
+    # finetune(model,dataset)

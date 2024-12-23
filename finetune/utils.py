@@ -1,9 +1,8 @@
 import pandas as pd
 import json, signal
-
 from tqdm import tqdm
 import torch, os
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, TrainerCallback, DataCollatorWithPadding
 from datasets import load_dataset
 import subprocess
 import random, numpy as np
@@ -11,24 +10,39 @@ import random, numpy as np
 config = {
     "max_input_length": 1024,
     "max_output_length": 512,
-    'batch_size': 40,
+    'batch_size': 60,
+    'batch_size_train': 10,
+    'learning_rate': {
+        'mbpp': 1e-5,
+        'mathqa': 1e-4,
+    },
+    'eval_steps': {
+        'mbpp': 5,
+        'mathqa': 100,
+    },
+    'log_steps': {
+        'mbpp': 1,
+        'mathqa': 10,
+    },
+    'early_stopping_patience': 3,
     'seed': 321876902
 }
 
 # dump results to csv
-def dump_results(dataset, model, method, tot, faillist):
-    results = pd.read_csv('results.csv',index_col="name")
-    res_row_name = f"{dataset}__{model}__{method}" if method else f"{dataset}__{model}"
-    res_correct = tot - len(faillist)
-    res_accuracy = f"{res_correct / tot:.2%}"
-    print(f"Results for {res_row_name}: {res_correct}/{tot} ({res_accuracy})")
-    results.loc[res_row_name, :] = [tot, res_correct, res_accuracy]
+def dump_results(dataset, model, method, tot, fail_num):
+    results = pd.read_csv('results.csv',index_col="model")
+    acc = int(tot-fail_num)
+    tot = int(tot)
+    model_name = f"{model}({method})" if method else model
+    res_message = f"{acc}/{tot} ({acc/tot:.2%})"
+    results.loc[model_name, dataset] = res_message
     results.to_csv('results.csv', index=True)
 
 # find the path of the dataset
 def find_data_path(dataset):
     if dataset == "mbpp":
-        data_path = "../prompt/datasets/sanitized-mbpp.json"
+        # data_path = "../prompt/datasets/sanitized-mbpp.json"
+        data_path = "tmp/mbpp_test.json"
     elif dataset == "humaneval":
         data_path = "../prompt/datasets/HumanEval.json"
     elif dataset == "mathqa":
@@ -57,9 +71,13 @@ def prepare_data(dataset_name):
     elif dataset_name == "mathqa":
         test_dataset = find_data_path("mathqa")
         train_dataset = test_dataset.replace("test", "train")
-        print(test_dataset, train_dataset)
-        return load_dataset('json', data_files={'test': test_dataset,
+        dataset = load_dataset('json', data_files={'test': test_dataset,
                                                 'train': train_dataset})
+        # there is no validation set, split 1/10 of the training set
+        splitted_dataset = dataset["train"].train_test_split(test_size=0.1, shuffle=True)
+        dataset["train"] = splitted_dataset["train"]
+        dataset["valid"] = splitted_dataset["test"]
+        return dataset
     else:
         raise ValueError("Invalid dataset: "+dataset_name)
 
@@ -82,6 +100,22 @@ def find_checkpoint(model):
     else:
         raise ValueError("Invalid model: "+model)
     return checkpoint
+
+# find checkpoint given the model path
+def find_checkpoint_path(model):
+    # model is a predefined name
+    if not os.path.exists(model):
+        # mode = qwen1.5, checkpoint = Qwen/Qwen2.5-1.5B-Instruct, model_name = qwen2.5-1.5B-Instruct
+        checkpoint = find_checkpoint(model)
+        model_name = checkpoint.split("/")[-1]
+        method = ""
+    # model is a directory in which the model is stored
+    else:
+        # model = 'output/Qwen/Qwen2.5-1.5B-Instruct/mbpp/best_model', checkpoint = model, model_name = Qwen2.5-1.5B-Instruct
+        checkpoint = model
+        model_name = model.split("/")[-3]
+        method = "finetuned"
+    return checkpoint, model_name, method
 
 # complete the generated code with the test cases
 def complete_code(code, problem, dataset, test_num=10):
@@ -169,19 +203,18 @@ def codegen_direct(model, dataset, get_input, process_output):
     model: starcoder-3b, codellama-instruct, codellama-python, qwen1.5, opencoder1.5
     dataset: mbpp, humaneval, mathqa
     """
-    model_name = model
-    checkpoint = find_checkpoint(model)
+    checkpoint, model_name, method = find_checkpoint_path(model)
+    model = AutoModelForCausalLM.from_pretrained(checkpoint,
+                                                 device_map="auto",
+                                                 local_files_only=True,
+                                                 trust_remote_code=True,
+                                                 torch_dtype=torch.bfloat16)
     tokenizer = AutoTokenizer.from_pretrained(checkpoint,
                                               use_fast=True,
                                               trust_remote_code=True,
                                               local_files_only=True)
     if not tokenizer.pad_token:
         tokenizer.pad_token = tokenizer.eos_token
-    model = AutoModelForCausalLM.from_pretrained(checkpoint, 
-                                             device_map="auto",
-                                             local_files_only=True,
-                                             trust_remote_code=True,
-                                             torch_dtype=torch.bfloat16)
 
     def codegen_batch(problems):
         questions = [get_input(problem,dataset,tokenizer) for problem in problems]
@@ -213,7 +246,7 @@ def codegen_direct(model, dataset, get_input, process_output):
             fail_list += res
             pbar.update(batch_size)
             pbar.set_postfix({"failed": len(fail_list)})
-    dump_results(dataset, model_name, "", len(problems), fail_list)
+    dump_results(dataset, model_name, method, len(problems), len(fail_list))
 
 # set seed for reproducibility
 def set_seed(seed):
@@ -222,6 +255,7 @@ def set_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
+# print special tokens in a tokenizer
 def print_special_tokens(tokenizer):
     print("Special tokens:")
     print(tokenizer.special_tokens_map)
@@ -229,4 +263,28 @@ def print_special_tokens(tokenizer):
         token_id = tokenizer.convert_tokens_to_ids(token)
         print(f"{token_name}: '{token}' (ID: {token_id})")
 
+class EarlyStoppingCallback(TrainerCallback):
+    def __init__(self, early_stopping_patience=1, early_stopping_threshold=0.0):
+        self.early_stopping_patience = early_stopping_patience
+        self.early_stopping_threshold = early_stopping_threshold
+        self.best_metric = None
+        self.patience_counter = 0
+    def on_evaluate(self, args, state, control, **kwargs):
+        metrics = state.log_history[-1]
+        current_metric = metrics.get("eval_loss", None)
+        if current_metric is None:
+            return
+        if self.best_metric is None:
+            self.best_metric = current_metric
+        else:
+            if current_metric + self.early_stopping_threshold < self.best_metric:
+                self.best_metric = current_metric
+                self.patience_counter = 0
+            else:
+                self.patience_counter += 1
+            if self.patience_counter >= self.early_stopping_patience:
+                control.should_training_stop = True
+                print(f"Early stop: No improvement for {self.patience_counter} evaluations")
 
+if __name__ == "__main__":
+    dump_results('mathqa','OpenCoder-1.5B-Instruct', 'finetuned', 100, 50)

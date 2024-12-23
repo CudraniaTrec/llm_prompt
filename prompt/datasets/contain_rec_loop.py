@@ -36,6 +36,27 @@ def has_recursive_call(code):
 
     return list(checker.recursive_functions)
 
+def has_loop_in_code(code):
+    """
+    检查Python代码中是否有循环
+    :param code: str, 待检查的Python代码
+    :return: bool, 是否有循环
+    """
+    try:
+        # 将代码解析为AST（抽象语法树）
+        tree = ast.parse(code)
+
+        # 遍历AST树
+        for node in ast.walk(tree):
+            # 检查是否有For或While节点
+            if isinstance(node, (ast.For, ast.While)):
+                return True
+
+        return False
+    except SyntaxError as e:
+        print(f"代码解析错误: {e}")
+        return False
+
 
 # 示例用法
 if __name__ == "__main__":
